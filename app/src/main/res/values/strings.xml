@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Circle Counter</string>
+    <string name="location_notification_title">Запись тренировки</string>
+    <string name="location_notification_text">GPS пишет трек…</string>
+</resources>
