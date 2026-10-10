@@ -8,12 +8,18 @@ package com.circlecounter.app.domain
  * - Spike-and-return (far from both neighbours, neighbours close) ⇒ drop.
  * - Large jump in a short time ⇒ drop.
  * - Reported accuracy worse than threshold ⇒ drop.
+ * - Large/fast GPS step while accelerometer says the phone is still ⇒ drop.
  *
  * Smoothing (EMA on lat/lon) reduces zig-zag inflation from phone GPS
  * without using pace/time to invent coordinates.
  */
 class GpsFilter(
     private val config: Config = Config(),
+    /**
+     * Optional accelerometer RMS for [fromMs, toMs] (wall clock).
+     * Null return = no motion data (skip the check).
+     */
+    private val motionRms: ((fromMs: Long, toMs: Long) -> Float?)? = null,
 ) {
     data class Config(
         /** ~10 s / 100 m; slightly above for residual GPS jitter. */
@@ -30,6 +36,10 @@ class GpsFilter(
          * 0.7 trims zig-zag length while keeping ring geometry.
          */
         val emaAlpha: Double = 0.70,
+        /** Accel RMS below this ⇒ treat as still (m/s²). */
+        val stationaryRms: Float = 0.55f,
+        val motionSuspectSpeedMps: Double = 2.2,
+        val motionSuspectJumpM: Double = 22.0,
     )
 
     private val pending = ArrayDeque<GeoPoint>()
@@ -148,6 +158,27 @@ class GpsFilter(
         val dtSec = ((next.timestampMs - prev.timestampMs).coerceAtLeast(1L)) / 1000.0
         if (d / dtSec > config.maxSpeedMetersPerSec) return false
         if (d > config.maxJumpMeters && dtSec < config.maxJumpTimeSec) return false
+        if (!passesMotionCheck(prev, next, d, dtSec)) return false
+        return true
+    }
+
+    private fun passesMotionCheck(
+        prev: GeoPoint,
+        next: GeoPoint,
+        distanceM: Double,
+        dtSec: Double,
+    ): Boolean {
+        val hint = motionRms ?: return true
+        val from = minOf(prev.timestampMs, next.timestampMs)
+        val to = maxOf(prev.timestampMs, next.timestampMs)
+        // Widen slightly — sensor samples use wall clock.
+        val rms = hint(from - 200L, to + 200L) ?: return true
+        val speed = if (dtSec > 0) distanceM / dtSec else 0.0
+        val suspectJump = distanceM >= config.motionSuspectJumpM ||
+            speed >= config.motionSuspectSpeedMps
+        if (suspectJump && rms < config.stationaryRms) {
+            return false
+        }
         return true
     }
 }

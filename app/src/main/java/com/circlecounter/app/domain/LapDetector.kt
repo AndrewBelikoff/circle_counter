@@ -34,6 +34,11 @@ class LapDetector(
         val pathRejectMeanMeters: Double = 60.0,
         val minLapMeters: Double = 260.0,
         /**
+         * Minimum bbox diagonal of a discovered lap. Rejects zig-zag "loops"
+         * that have enough arc length but sit in a tiny footprint (false rings).
+         */
+        val minLapExtentMeters: Double = 70.0,
+        /**
          * Upper bound for a single discovered lap. Keeps phone GPS teleports
          * from forming multi-kilometre false rings on a 400 m track.
          */
@@ -72,9 +77,7 @@ class LapDetector(
     private var completedLaps = 0
     private var hypothesisRejectedCount = 0
 
-    private var template: List<GeoPoint>? = knownTemplate?.takeIf { it.size >= 2 }
-        ?.let { GeoMath.resampleByDistance(it, config.pathSamples) }
-
+    private var template: List<GeoPoint>? = null
     private var anchor: GeoPoint? = null
     private var expectedLapMeters: Double? = null
     private var currentLapStartIndex = 0
@@ -88,18 +91,32 @@ class LapDetector(
     /** Must leave the start zone before a new lap can be completed. */
     private var leftStartZone = false
 
-    private val knownMode = template != null
+    private val knownMode: Boolean
 
     init {
-        if (knownMode) {
+        val candidate = knownTemplate
+            ?.takeIf { it.size >= 2 }
+            ?.let { GeoMath.resampleByDistance(it, config.pathSamples) }
+        val usable = candidate != null && isPlausibleRing(candidate)
+        knownMode = usable
+        if (usable) {
+            template = candidate
             phase = Phase.CONFIRMED
             completedLaps = 0
             currentLapStartIndex = 0
-            anchor = template!!.first()
-            expectedLapMeters = GeoMath.pathLengthMeters(template!!)
+            anchor = candidate!!.first()
+            expectedLapMeters = GeoMath.pathLengthMeters(candidate)
             leftStartZone = false
             minDistToAnchorMeters = Double.POSITIVE_INFINITY
         }
+    }
+
+    private fun isPlausibleRing(ring: List<GeoPoint>): Boolean {
+        val len = GeoMath.pathLengthMeters(ring)
+        val extent = GeoMath.pathExtentMeters(ring)
+        return len >= config.minLapMeters &&
+            len <= config.maxLapMeters &&
+            extent >= config.minLapExtentMeters
     }
 
     fun snapshot(): Snapshot {
@@ -204,9 +221,13 @@ class LapDetector(
         val lapPoints = points.subList(closure.startIndex, points.size).toList()
         val lapLen = GeoMath.pathLengthMeters(lapPoints)
         if (lapLen < config.minLapMeters || lapLen > config.maxLapMeters) return
+        if (GeoMath.pathExtentMeters(lapPoints) < config.minLapExtentMeters) return
+
+        val ring = GeoMath.resampleByDistance(lapPoints, config.pathSamples)
+        if (!isPlausibleRing(ring)) return
 
         set1 = lapPoints
-        template = GeoMath.resampleByDistance(lapPoints, config.pathSamples)
+        template = ring
         // Closing tip is the practical start/finish for the next lap.
         anchor = points.last()
         expectedLapMeters = lapLen
@@ -227,11 +248,17 @@ class LapDetector(
                     resetLapWindow(points.lastIndex)
                     return
                 }
+                if (GeoMath.pathExtentMeters(currentLap) < config.minLapExtentMeters) {
+                    resetLapWindow(points.lastIndex)
+                    return
+                }
                 set2 = currentLap
                 expectedLapMeters = blendLapLength(expectedLapMeters, lapLen)
-                template = GeoMath.averagePaths(listOfNotNull(set1, set2), config.pathSamples)
-                // Start/finish = where the repeating pattern closes.
-                anchor = template!!.first()
+                val averaged = GeoMath.averagePaths(listOfNotNull(set1, set2), config.pathSamples)
+                if (isPlausibleRing(averaged)) {
+                    template = averaged
+                    anchor = averaged.first()
+                }
                 phase = Phase.HYPOTHESIS_THIRD
                 // Pattern is usable: credit all laps since Start, not only "2".
                 recountFromStartOfMovement()
@@ -251,12 +278,21 @@ class LapDetector(
                     resetLapWindow(points.lastIndex)
                     return
                 }
-                template = GeoMath.averagePaths(
+                if (GeoMath.pathExtentMeters(currentLap) < config.minLapExtentMeters) {
+                    resetLapWindow(points.lastIndex)
+                    return
+                }
+                val averaged = GeoMath.averagePaths(
                     listOfNotNull(set1, set2, currentLap),
                     config.pathSamples,
                 )
-                expectedLapMeters = blendLapLength(expectedLapMeters, lapLen)
-                anchor = template!!.first()
+                if (isPlausibleRing(averaged)) {
+                    template = averaged
+                    expectedLapMeters = blendLapLength(expectedLapMeters, lapLen)
+                    anchor = averaged.first()
+                } else {
+                    expectedLapMeters = blendLapLength(expectedLapMeters, lapLen)
+                }
                 phase = Phase.CONFIRMED
                 // Re-apply confirmed pattern from the first GPS point after Start.
                 recountFromStartOfMovement()
@@ -352,11 +388,15 @@ class LapDetector(
                 val tpl = template
                 val expected = expectedLapMeters
                 if (tpl != null && currentLap.size >= 4 && expected != null &&
-                    lapLen in expected * 0.75..expected * 1.25
+                    lapLen in expected * 0.75..expected * 1.25 &&
+                    GeoMath.pathExtentMeters(currentLap) >= config.minLapExtentMeters
                 ) {
                     // Gentle refine only when the new lap agrees with the estimate.
-                    template = GeoMath.averagePaths(listOf(tpl, currentLap), config.pathSamples)
-                    expectedLapMeters = blendLapLength(expected, lapLen)
+                    val averaged = GeoMath.averagePaths(listOf(tpl, currentLap), config.pathSamples)
+                    if (isPlausibleRing(averaged)) {
+                        template = averaged
+                        expectedLapMeters = blendLapLength(expected, lapLen)
+                    }
                 }
                 // Keep confirmed anchor stable — do not chase GPS drift each lap.
                 completedLaps += 1
@@ -480,6 +520,8 @@ class LapDetector(
             if (lapLen < config.minLapMeters || lapLen > config.maxLapMeters) continue
             if (GeoMath.haversineMeters(points[i], tip) > config.learningMatchRadiusMeters) continue
             if (points.size - i < 8) continue
+            val extent = GeoMath.pathExtentMeters(points.subList(i, points.size))
+            if (extent < config.minLapExtentMeters) continue
 
             // Score: distance from classic 400 m track, slight penalty for very long loops.
             val score = kotlin.math.abs(lapLen - 400.0) + if (lapLen > 800) (lapLen - 800) * 0.15 else 0.0

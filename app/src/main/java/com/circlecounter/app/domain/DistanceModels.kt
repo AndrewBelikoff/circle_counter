@@ -62,13 +62,19 @@ object PaceCalculator {
     }
 
     fun formatPace(secPerKm: Double?): String {
+        val core = formatPaceCore(secPerKm) ?: return "—:—/км"
+        return "$core/км"
+    }
+
+    /** `m:ss` without unit — for compact UI metrics. */
+    fun formatPaceCore(secPerKm: Double?): String? {
         if (secPerKm == null || secPerKm.isNaN() || secPerKm.isInfinite() || secPerKm > 3600) {
-            return "—:—/км"
+            return null
         }
         val total = secPerKm.toInt().coerceAtLeast(0)
         val min = total / 60
         val sec = total % 60
-        return "%d:%02d/км".format(min, sec)
+        return "%d:%02d".format(min, sec)
     }
 }
 

@@ -5,7 +5,9 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.content.Context
 import android.content.Intent
+import android.hardware.SensorManager
 import android.os.IBinder
 import android.os.Looper
 import androidx.core.app.NotificationCompat
@@ -23,6 +25,7 @@ import kotlinx.coroutines.flow.asSharedFlow
 
 class LocationTrackingService : Service() {
     private val fused by lazy { LocationServices.getFusedLocationProviderClient(this) }
+    private val motionTracker = MotionTracker()
 
     private val callback = object : LocationCallback() {
         override fun onLocationResult(result: LocationResult) {
@@ -43,6 +46,9 @@ class LocationTrackingService : Service() {
         super.onCreate()
         ensureChannel()
         startForeground(NOTIFICATION_ID, buildNotification())
+        val sm = getSystemService(Context.SENSOR_SERVICE) as SensorManager
+        motionTracker.start(sm)
+        sharedMotion = motionTracker
         startUpdates()
     }
 
@@ -59,6 +65,8 @@ class LocationTrackingService : Service() {
 
     override fun onDestroy() {
         stopUpdates()
+        motionTracker.stop()
+        if (sharedMotion === motionTracker) sharedMotion = null
         super.onDestroy()
     }
 
@@ -112,5 +120,9 @@ class LocationTrackingService : Service() {
 
         private val _points = MutableSharedFlow<GeoPoint>(extraBufferCapacity = 64)
         val points: SharedFlow<GeoPoint> = _points.asSharedFlow()
+
+        @Volatile
+        var sharedMotion: MotionTracker? = null
+            private set
     }
 }

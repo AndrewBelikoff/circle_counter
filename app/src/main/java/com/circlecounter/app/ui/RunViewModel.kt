@@ -33,6 +33,15 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.util.UUID
 
+enum class GpsQuality {
+    /** Fix present and accuracy is usable for lap tracking. */
+    GOOD,
+    /** Fix present but noisy / coarse. */
+    POOR,
+    /** No recent fix. */
+    ABSENT,
+}
+
 data class RunUiState(
     val isRunning: Boolean = false,
     val isPaused: Boolean = false,
@@ -44,6 +53,8 @@ data class RunUiState(
     val paceGps: String = "—:—/км",
     val paceManual: String = "—:—/км",
     val paceComputed: String = "—:—/км",
+    /** Compact GPS pace `m:ss` for the run metric tile. */
+    val paceMetricText: String = "—:—",
     val autoCountActive: Boolean = false,
     val statusText: String = "Выберите трек или начните новый",
     val finished: FinishedRun? = null,
@@ -52,6 +63,8 @@ data class RunUiState(
     val heartRate: HeartRateState = HeartRateState(),
     val avgHeartRateBpm: Int? = null,
     val maxHeartRateBpm: Int? = null,
+    val gpsQuality: GpsQuality = GpsQuality.ABSENT,
+    val gpsAccuracyMeters: Float? = null,
 )
 
 data class FinishedRun(
@@ -83,6 +96,13 @@ class RunViewModel(application: Application) : AndroidViewModel(application) {
     private var hrSum = 0L
     private var hrCount = 0
     private var hrMax = 0
+    private var lastGpsAtMs = 0L
+
+    companion object {
+        private const val GPS_STALE_MS = 4_000L
+        private const val GPS_GOOD_ACCURACY_M = 18f
+        private const val GPS_POOR_ACCURACY_M = 45f
+    }
 
     init {
         viewModelScope.launch {
@@ -164,7 +184,9 @@ class RunViewModel(application: Application) : AndroidViewModel(application) {
         if (_ui.value.isRunning) return
         val track = _ui.value.selectedTrack
         detector = LapDetector(knownTemplate = track?.templatePoints())
-        gpsFilter = GpsFilter()
+        gpsFilter = GpsFilter(
+            motionRms = { from, to -> LocationTrackingService.sharedMotion?.rmsBetween(from, to) },
+        )
         startedAtMs = System.currentTimeMillis()
         accumulatedElapsedMs = 0L
         segmentStartedAtMs = startedAtMs
@@ -203,6 +225,7 @@ class RunViewModel(application: Application) : AndroidViewModel(application) {
             }
         }
 
+        lastGpsAtMs = 0L
         _ui.update {
             it.copy(
                 isRunning = true,
@@ -212,6 +235,9 @@ class RunViewModel(application: Application) : AndroidViewModel(application) {
                 maxHeartRateBpm = null,
                 statusText = if (track == null) "Запись нового трека…" else "Запись «${track.name}»…",
                 autoCountActive = track != null,
+                gpsQuality = GpsQuality.ABSENT,
+                gpsAccuracyMeters = null,
+                paceMetricText = "—:—",
             )
         }
         publishFromSnapshot(lastSnapshot ?: return)
@@ -409,9 +435,26 @@ class RunViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun onPoint(point: GeoPoint) {
+        lastGpsAtMs = System.currentTimeMillis()
+        _ui.update {
+            it.copy(
+                gpsQuality = classifyGps(point.accuracyMeters, fresh = true),
+                gpsAccuracyMeters = point.accuracyMeters,
+            )
+        }
         val filter = gpsFilter ?: return
         for (accepted in filter.offer(point)) {
             onFilteredPoint(accepted)
+        }
+    }
+
+    private fun classifyGps(accuracyMeters: Float?, fresh: Boolean): GpsQuality {
+        if (!fresh) return GpsQuality.ABSENT
+        val acc = accuracyMeters ?: return GpsQuality.POOR
+        return when {
+            acc <= GPS_GOOD_ACCURACY_M -> GpsQuality.GOOD
+            acc <= GPS_POOR_ACCURACY_M -> GpsQuality.POOR
+            else -> GpsQuality.ABSENT
         }
     }
 
@@ -452,6 +495,9 @@ class RunViewModel(application: Application) : AndroidViewModel(application) {
                 paceComputed = PaceCalculator.formatPace(
                     distances.computedMeters?.let { m -> PaceCalculator.paceSecPerKm(m, elapsed) }
                 ),
+                paceMetricText = PaceCalculator.formatPaceCore(
+                    PaceCalculator.paceSecPerKm(distances.gpsMeters, elapsed)
+                ) ?: "—:—",
                 statusText = if (it.isPaused) "Пауза" else status,
             )
         }
@@ -461,6 +507,8 @@ class RunViewModel(application: Application) : AndroidViewModel(application) {
         if (!_ui.value.isRunning || _ui.value.isPaused) return
         val elapsed = currentElapsedMs()
         val d = _ui.value.distances
+        val gpsFresh = lastGpsAtMs > 0L &&
+            System.currentTimeMillis() - lastGpsAtMs <= GPS_STALE_MS
         _ui.update {
             it.copy(
                 elapsedMs = elapsed,
@@ -471,6 +519,10 @@ class RunViewModel(application: Application) : AndroidViewModel(application) {
                 paceComputed = PaceCalculator.formatPace(
                     d.computedMeters?.let { m -> PaceCalculator.paceSecPerKm(m, elapsed) }
                 ),
+                paceMetricText = PaceCalculator.formatPaceCore(
+                    PaceCalculator.paceSecPerKm(d.gpsMeters, elapsed)
+                ) ?: "—:—",
+                gpsQuality = classifyGps(it.gpsAccuracyMeters, fresh = gpsFresh),
             )
         }
     }

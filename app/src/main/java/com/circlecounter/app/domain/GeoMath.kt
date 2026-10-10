@@ -28,6 +28,28 @@ object GeoMath {
     }
 
     /**
+     * Spatial span of a path (bbox diagonal). Used to reject collapsed "loops"
+     * whose GPS arc length is long from zig-zag but the ring is tiny.
+     */
+    fun pathExtentMeters(points: List<GeoPoint>): Double {
+        if (points.isEmpty()) return 0.0
+        var minLat = points.first().latitude
+        var maxLat = minLat
+        var minLon = points.first().longitude
+        var maxLon = minLon
+        for (p in points) {
+            if (p.latitude < minLat) minLat = p.latitude
+            if (p.latitude > maxLat) maxLat = p.latitude
+            if (p.longitude < minLon) minLon = p.longitude
+            if (p.longitude > maxLon) maxLon = p.longitude
+        }
+        return haversineMeters(
+            GeoPoint(minLat, minLon),
+            GeoPoint(maxLat, maxLon),
+        )
+    }
+
+    /**
      * Resample a polyline to [count] points evenly spaced by arc length.
      */
     fun resampleByDistance(points: List<GeoPoint>, count: Int): List<GeoPoint> {
@@ -96,7 +118,7 @@ object GeoMath {
     fun averagePaths(paths: List<List<GeoPoint>>, samples: Int = 64): List<GeoPoint> {
         require(paths.isNotEmpty())
         val resampled = paths.map { resampleByDistance(it, samples) }
-        return List(samples) { i ->
+        val averaged = List(samples) { i ->
             var lat = 0.0
             var lon = 0.0
             for (path in resampled) {
@@ -105,6 +127,11 @@ object GeoMath {
             }
             GeoPoint(lat / resampled.size, lon / resampled.size)
         }
+        // Out-of-phase averages collapse toward the centroid — keep the longest source.
+        val avgLen = pathLengthMeters(averaged)
+        val best = resampled.maxBy { pathLengthMeters(it) }
+        val bestLen = pathLengthMeters(best)
+        return if (bestLen > 1.0 && avgLen < bestLen * 0.55) best else averaged
     }
 
     /**
