@@ -52,6 +52,15 @@ object DistanceCalculator {
 
 object PaceCalculator {
     /**
+     * Distance for training metrics: prefer ring length × laps over GPS polyline.
+     * GPS arc length on a phone often zig-zags and makes pace look too fast.
+     */
+    fun trainingDistanceMeters(distances: DistanceBreakdown): Double =
+        distances.manualMeters
+            ?: distances.computedMeters
+            ?: distances.gpsMeters
+
+    /**
      * Pace in seconds per kilometer. Null if distance or time insufficient.
      */
     fun paceSecPerKm(distanceMeters: Double, elapsedMs: Long): Double? {
@@ -59,6 +68,12 @@ object PaceCalculator {
         val km = distanceMeters / 1000.0
         val sec = elapsedMs / 1000.0
         return sec / km
+    }
+
+    /** Instantaneous pace from fused location speed (m/s). */
+    fun paceSecPerKmFromSpeedMps(speedMps: Float?): Double? {
+        if (speedMps == null || speedMps < 0.8f || speedMps > 12f) return null
+        return 1000.0 / speedMps.toDouble()
     }
 
     fun formatPace(secPerKm: Double?): String {

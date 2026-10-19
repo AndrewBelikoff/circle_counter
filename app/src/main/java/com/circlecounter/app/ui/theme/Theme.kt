@@ -5,24 +5,31 @@ import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.graphics.Color
 
-private val Forest = Color(0xFF1B4332)
-private val Moss = Color(0xFF2D6A4F)
-private val Mist = Color(0xFFD8F3DC)
-private val Leaf = Color(0xFF95D5B2)
-private val Ink = Color(0xFF081C15)
-private val Warn = Color(0xFFE9C46A)
+/** High-contrast dark UI: charcoal + near-white text + bright accent. */
+private val Bg = Color(0xFF0E1116)
+private val Surface = Color(0xFF1A212B)
+private val SurfaceHi = Color(0xFF243041)
+private val Text = Color(0xFFF3F5F8)
+private val TextDim = Color(0xFFB7C0CC)
+private val Accent = Color(0xFFFFC14D)
+private val AccentSoft = Color(0xFF5EEAD4)
+private val Danger = Color(0xFFFF6B6B)
 
 private val scheme = darkColorScheme(
-    primary = Leaf,
-    onPrimary = Ink,
-    secondary = Mist,
-    onSecondary = Ink,
-    background = Forest,
-    onBackground = Mist,
-    surface = Moss,
-    onSurface = Mist,
-    error = Warn,
-    onError = Ink,
+    primary = Accent,
+    onPrimary = Color(0xFF1A1200),
+    secondary = AccentSoft,
+    onSecondary = Color(0xFF042F2E),
+    tertiary = TextDim,
+    background = Bg,
+    onBackground = Text,
+    surface = Surface,
+    onSurface = Text,
+    surfaceVariant = SurfaceHi,
+    onSurfaceVariant = TextDim,
+    error = Danger,
+    onError = Color(0xFF2A0000),
+    outline = Color(0xFF3A4556),
 )
 
 @Composable

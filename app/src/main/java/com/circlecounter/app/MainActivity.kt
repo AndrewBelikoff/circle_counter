@@ -128,6 +128,12 @@ class MainActivity : ComponentActivity() {
             ) {
                 need += Manifest.permission.POST_NOTIFICATIONS
             }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q &&
+                ContextCompat.checkSelfPermission(this, Manifest.permission.ACTIVITY_RECOGNITION)
+                != PackageManager.PERMISSION_GRANTED
+            ) {
+                need += Manifest.permission.ACTIVITY_RECOGNITION
+            }
         }
 
         // BLE scan on Android < 12 still needs location.

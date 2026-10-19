@@ -133,6 +133,7 @@ class GpsFilter(
             longitude = lon,
             timestampMs = candidate.timestampMs,
             accuracyMeters = candidate.accuracyMeters,
+            speedMps = candidate.speedMps,
         )
         if (acceptedSmoothed.isNotEmpty()) {
             val prev = acceptedSmoothed.last()

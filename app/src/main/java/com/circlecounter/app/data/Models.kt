@@ -71,4 +71,9 @@ data class AppStore(
     val knownTracks: List<KnownTrack> = emptyList(),
     val runs: List<SavedRun> = emptyList(),
     val preferredHrSensor: PreferredHrSensor? = null,
+    /**
+     * Global manual lap length (meters). Kept until the user changes it;
+     * also copied onto tracks when saving/refining.
+     */
+    val manualLapLengthMeters: Double? = null,
 )

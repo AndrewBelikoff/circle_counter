@@ -3,6 +3,7 @@ package com.circlecounter.app.ui.screens
 import android.content.Intent
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -30,6 +31,8 @@ import androidx.compose.ui.unit.sp
 import androidx.core.content.FileProvider
 import com.circlecounter.app.data.KnownTrack
 import com.circlecounter.app.domain.DistanceFormatter
+import com.circlecounter.app.domain.LapStat
+import com.circlecounter.app.domain.LapStatsCalculator
 import com.circlecounter.app.ui.FinishedRun
 import java.io.File
 
@@ -48,6 +51,7 @@ fun ResultScreen(
     var selectedExistingId by remember { mutableStateOf<String?>(null) }
     val run = finished.run
     val scroll = rememberScrollState()
+    val onBg = MaterialTheme.colorScheme.onBackground
 
     Column(
         modifier = Modifier
@@ -60,7 +64,7 @@ fun ResultScreen(
             text = when {
                 finished.needsTrackDecision -> "Круги определены"
                 finished.detectionFailed -> "Круги не определены"
-                else -> "Готово"
+                else -> "Статистика"
             },
             style = MaterialTheme.typography.headlineMedium,
             fontWeight = FontWeight.Bold,
@@ -70,13 +74,38 @@ fun ResultScreen(
             },
         )
         Spacer(Modifier.height(12.dp))
-        Text("Время: ${DistanceFormatter.formatElapsed(run.elapsedMs)}")
-        Text("Круги: ${run.completedLaps}")
-        Text("GPS: ${DistanceFormatter.formatKmM(run.gpsDistanceMeters)}")
-        Text("Ручная: ${DistanceFormatter.formatKmM(run.manualDistanceMeters)}")
-        Text("По треку: ${DistanceFormatter.formatKmM(run.computedDistanceMeters)}")
+        Text("Время: ${DistanceFormatter.formatElapsed(run.elapsedMs)}", color = onBg)
+        Text("Круги: ${run.completedLaps}", color = onBg)
+        Text("GPS: ${DistanceFormatter.formatKmM(run.gpsDistanceMeters)}", color = onBg)
+        Text("Ручная: ${DistanceFormatter.formatKmM(run.manualDistanceMeters)}", color = onBg)
+        Text("По треку: ${DistanceFormatter.formatKmM(run.computedDistanceMeters)}", color = onBg)
         if (run.avgHeartRateBpm != null || run.maxHeartRateBpm != null) {
-            Text("Пульс ср.: ${run.avgHeartRateBpm ?: "—"} · макс.: ${run.maxHeartRateBpm ?: "—"}")
+            Text(
+                "Пульс ср.: ${run.avgHeartRateBpm ?: "—"} · макс.: ${run.maxHeartRateBpm ?: "—"}",
+                color = onBg,
+            )
+        }
+
+        if (finished.lapStats.isNotEmpty()) {
+            Spacer(Modifier.height(20.dp))
+            Text(
+                "По кругам",
+                fontWeight = FontWeight.SemiBold,
+                fontSize = 18.sp,
+                color = MaterialTheme.colorScheme.primary,
+            )
+            Spacer(Modifier.height(10.dp))
+            finished.lapStats.forEach { lap ->
+                LapStatCard(lap)
+                Spacer(Modifier.height(10.dp))
+            }
+        } else if (run.completedLaps == 0) {
+            Spacer(Modifier.height(12.dp))
+            Text(
+                "Нет завершённых кругов для разбивки.",
+                fontSize = 14.sp,
+                color = onBg.copy(alpha = 0.75f),
+            )
         }
 
         finished.decisionMessage?.let {
@@ -114,12 +143,13 @@ fun ResultScreen(
                 "Что сделать с кольцом?",
                 fontWeight = FontWeight.SemiBold,
                 fontSize = 18.sp,
+                color = onBg,
             )
             Spacer(Modifier.height(8.dp))
             Text(
                 "Трек при старте не был назван. Выберите действие.",
                 fontSize = 14.sp,
-                color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.8f),
+                color = onBg.copy(alpha = 0.8f),
             )
             Spacer(Modifier.height(12.dp))
 
@@ -147,11 +177,11 @@ fun ResultScreen(
                     Text(
                         "Отмена сохранит трек как ${formatHint(run.startedAtMs)} (макс. 10 таких).",
                         fontSize = 12.sp,
-                        color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.65f),
+                        color = onBg.copy(alpha = 0.65f),
                     )
                 }
                 DecisionMode.ADD -> {
-                    Text("Выберите трек", fontWeight = FontWeight.Medium)
+                    Text("Выберите трек", fontWeight = FontWeight.Medium, color = onBg)
                     Spacer(Modifier.height(8.dp))
                     knownTracks.forEach { track ->
                         val selected = selectedExistingId == track.id
@@ -160,6 +190,7 @@ fun ResultScreen(
                                 append(track.name)
                                 if (track.autoNamed) append(" · авто")
                             },
+                            color = onBg,
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .background(
@@ -216,7 +247,7 @@ fun ResultScreen(
             Text(
                 text = "Трек можно выгрузить, но сохранить как кольцо нельзя — круги не подтверждены.",
                 fontSize = 14.sp,
-                color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.8f),
+                color = onBg.copy(alpha = 0.8f),
             )
         }
 
@@ -231,6 +262,47 @@ fun ResultScreen(
         ) {
             Text("На главную")
         }
+    }
+}
+
+@Composable
+private fun LapStatCard(lap: LapStat) {
+    val onBg = MaterialTheme.colorScheme.onBackground
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(MaterialTheme.colorScheme.surface, RoundedCornerShape(14.dp))
+            .padding(14.dp),
+        verticalArrangement = Arrangement.spacedBy(4.dp),
+    ) {
+        Text(
+            "Круг ${lap.lapNumber}",
+            fontWeight = FontWeight.Bold,
+            color = MaterialTheme.colorScheme.primary,
+            fontSize = 16.sp,
+        )
+        Text("Время: ${DistanceFormatter.formatElapsed(lap.elapsedMs)}", color = onBg)
+        Text(
+            "Дистанция GPS: ${DistanceFormatter.formatKmM(lap.gpsDistanceMeters)}",
+            color = onBg,
+        )
+        Text(
+            "Дистанция ручная: ${DistanceFormatter.formatKmM(lap.manualDistanceMeters)}",
+            color = onBg,
+        )
+        Text(
+            "Скорость GPS: ${LapStatsCalculator.formatSpeedKmh(lap.speedGpsKmh)}",
+            color = onBg,
+        )
+        Text(
+            "Скорость по ручной: ${LapStatsCalculator.formatSpeedKmh(lap.speedManualKmh)}",
+            color = onBg,
+        )
+        Text(
+            "Пульс ср.: ${lap.avgHeartRateBpm ?: "—"} · макс.: ${lap.maxHeartRateBpm ?: "—"}",
+            color = onBg,
+        )
+        Text("Каденс ср.: ${lap.avgCadenceSpm?.let { "$it шаг/мин" } ?: "—"}", color = onBg)
     }
 }
 

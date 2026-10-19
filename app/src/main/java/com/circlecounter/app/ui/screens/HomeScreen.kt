@@ -117,7 +117,7 @@ fun HomeScreen(
             value = state.manualLapLengthInput,
             onValueChange = onManualLength,
             modifier = Modifier.fillMaxWidth(),
-            label = { Text("Длина круга вручную, м (необязательно)") },
+            label = { Text("Длина круга вручную, м (сохраняется)") },
             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
             singleLine = true,
         )

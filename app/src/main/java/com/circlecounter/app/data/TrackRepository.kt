@@ -52,7 +52,7 @@ class TrackRepository(context: Context) {
         autoNamed: Boolean = false,
     ): KnownTrack {
         val now = System.currentTimeMillis()
-        val computed = GeoMath.pathLengthMeters(template)
+        val computed = GeoMath.ringLengthMeters(template)
         val track = KnownTrack(
             id = UUID.randomUUID().toString(),
             name = name.trim(),
@@ -74,20 +74,44 @@ class TrackRepository(context: Context) {
     }
 
     /**
-     * Merge a confirmed lap template into an existing track and bump freshness.
+     * Merge this run's ring into an existing track and bump freshness.
+     *
+     * The stored shape carries the weight of previous runs; a ring whose length
+     * disagrees with the manual lap length is not learned from, and a stored
+     * shape that disagrees with it is replaced by the new ring.
      */
-    suspend fun refineTrack(trackId: String, newLapTemplate: List<GeoPoint>): KnownTrack? {
+    suspend fun refineTrack(
+        trackId: String,
+        newRing: List<GeoPoint>,
+        lapsUsed: Int = 1,
+        manualLapLengthMeters: Double? = null,
+    ): KnownTrack? {
         val store = _store.value
         val idx = store.knownTracks.indexOfFirst { it.id == trackId }
         if (idx < 0) return null
         val old = store.knownTracks[idx]
-        val merged = GeoMath.averagePaths(
-            listOf(old.templatePoints(), newLapTemplate),
-            samples = 64,
-        )
+        val manual = manualLapLengthMeters ?: old.manualLapLengthMeters
+        fun fitsManual(len: Double) =
+            manual == null || len in manual * MANUAL_FIT_MIN..manual * MANUAL_FIT_MAX
+
+        val oldRing = old.templatePoints()
+        val newLen = GeoMath.ringLengthMeters(newRing)
+        val merged = when {
+            newRing.size < 3 || !fitsManual(newLen) -> oldRing
+            oldRing.size < 3 || !fitsManual(GeoMath.ringLengthMeters(oldRing)) ->
+                GeoMath.resampleClosedRing(newRing, TEMPLATE_SAMPLES)
+            else -> GeoMath.averageRings(
+                listOf(oldRing, newRing),
+                samples = TEMPLATE_SAMPLES,
+                weights = listOf(
+                    old.runCount.coerceIn(1, MAX_HISTORY_WEIGHT).toDouble(),
+                    (lapsUsed / 4.0).coerceIn(0.5, 2.0),
+                ),
+            )
+        }
         val updated = old.copy(
             template = merged.map { StoredPoint.from(it) },
-            computedLapLengthMeters = GeoMath.pathLengthMeters(merged),
+            computedLapLengthMeters = GeoMath.ringLengthMeters(merged),
             runCount = old.runCount + 1,
             updatedAtMs = System.currentTimeMillis(),
         )
@@ -143,7 +167,32 @@ class TrackRepository(context: Context) {
         persist(store.copy(preferredHrSensor = sensor))
     }
 
+    /** Persist global manual lap length; also stamps the selected track when [trackId] is set. */
+    suspend fun setManualLapLength(meters: Double?, trackId: String? = null) {
+        val store = _store.value
+        val tracks = if (trackId != null) {
+            store.knownTracks.map {
+                if (it.id == trackId) {
+                    it.copy(
+                        manualLapLengthMeters = meters,
+                        updatedAtMs = System.currentTimeMillis(),
+                    )
+                } else {
+                    it
+                }
+            }
+        } else {
+            store.knownTracks
+        }
+        persist(store.copy(manualLapLengthMeters = meters, knownTracks = tracks))
+    }
+
     companion object {
+        private const val TEMPLATE_SAMPLES = 64
+        private const val MAX_HISTORY_WEIGHT = 6
+        private const val MANUAL_FIT_MIN = 0.85
+        private const val MANUAL_FIT_MAX = 1.15
+
         private val autoNameFormat = SimpleDateFormat("yy-MM-dd_HH:mm", Locale.US)
 
         fun autoNameForStart(startedAtMs: Long): String =

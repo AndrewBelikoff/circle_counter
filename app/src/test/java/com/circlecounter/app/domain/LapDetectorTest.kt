@@ -76,6 +76,27 @@ class LapDetectorTest {
     }
 
     @Test
+    fun closesLapsAtStartPressLocationNotTemplateOrigin() {
+        // Start mid-lap: first point is halfway around the oval, not the template vertex.
+        val full = generateOvalLaps(laps = 6, pointsPerLap = 80, radiusMeters = 63.7)
+        val offset = 40
+        val session = full.drop(offset).take(80 * 5)
+        val template = generateOvalLaps(laps = 1, pointsPerLap = 80, radiusMeters = 63.7)
+        val detector = LapDetector(knownTemplate = template)
+        var snap = detector.snapshot()
+        for (p in session) {
+            snap = detector.addPoint(p)
+        }
+        assertEquals(LapDetector.Phase.CONFIRMED, snap.phase)
+        assertTrue("gate should be first GPS after Start", snap.startGate != null)
+        assertTrue("laps=${snap.completedLaps}", snap.completedLaps >= 3)
+        val gate = snap.startGate!!
+        val tplStart = template.first()
+        val gateShift = GeoMath.haversineMeters(gate, tplStart)
+        assertTrue("start mid-track gate shift should be meaningful: $gateShift", gateShift > 40.0)
+    }
+
+    @Test
     fun knownTrackCountsFromFirstLap() {
         val templateLap = generateOvalLaps(laps = 1, pointsPerLap = 80, radiusMeters = 63.7)
         val detector = LapDetector(knownTemplate = templateLap)
@@ -86,6 +107,7 @@ class LapDetectorTest {
         for (p in run) {
             snap = detector.addPoint(p)
         }
+        snap = detector.finish()
         assertTrue("expected >= 2 laps, got ${snap.completedLaps}", snap.completedLaps >= 2)
     }
 

@@ -8,6 +8,7 @@ import androidx.lifecycle.viewModelScope
 import com.circlecounter.app.CircleCounterApp
 import com.circlecounter.app.data.GpxExporter
 import com.circlecounter.app.data.KnownTrack
+import com.circlecounter.app.data.RunLogStore
 import com.circlecounter.app.data.SavedRun
 import com.circlecounter.app.data.StoredPoint
 import com.circlecounter.app.data.TrackRepository
@@ -16,8 +17,12 @@ import com.circlecounter.app.domain.DistanceCalculator
 import com.circlecounter.app.domain.DistanceFormatter
 import com.circlecounter.app.domain.GeoPoint
 import com.circlecounter.app.domain.GpsFilter
+import com.circlecounter.app.domain.InstantPaceEstimator
 import com.circlecounter.app.domain.LapDetector
+import com.circlecounter.app.domain.LapStat
+import com.circlecounter.app.domain.LapStatsCalculator
 import com.circlecounter.app.domain.PaceCalculator
+import com.circlecounter.app.domain.TimedSample
 import com.circlecounter.app.hr.HeartRateManager
 import com.circlecounter.app.hr.HeartRateState
 import com.circlecounter.app.hr.HrConnectionState
@@ -53,8 +58,10 @@ data class RunUiState(
     val paceGps: String = "—:—/км",
     val paceManual: String = "—:—/км",
     val paceComputed: String = "—:—/км",
-    /** Compact GPS pace `m:ss` for the run metric tile. */
+    /** Near-term pace `m:ss` (fused speed / ~4 s window), not whole-run average. */
     val paceMetricText: String = "—:—",
+    /** Live cadence, steps/min. */
+    val cadenceSpm: Int? = null,
     val autoCountActive: Boolean = false,
     val statusText: String = "Выберите трек или начните новый",
     val finished: FinishedRun? = null,
@@ -74,12 +81,14 @@ data class FinishedRun(
     val needsTrackDecision: Boolean,
     val ringTemplate: List<GeoPoint>?,
     val gpx: String,
+    val lapStats: List<LapStat> = emptyList(),
     val decisionDone: Boolean = false,
     val decisionMessage: String? = null,
 )
 
 class RunViewModel(application: Application) : AndroidViewModel(application) {
     private val repo = (application as CircleCounterApp).trackRepository
+    private val runLogStore = RunLogStore(application)
     private val heartRateManager = HeartRateManager(application, viewModelScope)
 
     private val _ui = MutableStateFlow(RunUiState())
@@ -97,6 +106,10 @@ class RunViewModel(application: Application) : AndroidViewModel(application) {
     private var hrCount = 0
     private var hrMax = 0
     private var lastGpsAtMs = 0L
+    private val instantPace = InstantPaceEstimator()
+    private val rawLogPoints = mutableListOf<GeoPoint>()
+    private val hrTimeline = mutableListOf<TimedSample>()
+    private var manualLengthHydrated = false
 
     companion object {
         private const val GPS_STALE_MS = 4_000L
@@ -109,9 +122,22 @@ class RunViewModel(application: Application) : AndroidViewModel(application) {
             repo.store.collect { store ->
                 val preferred = store.preferredHrSensor
                 heartRateManager.setPreferred(preferred?.address, preferred?.name)
-                _ui.update {
-                    it.copy(
+                _ui.update { ui ->
+                    val hydrated = if (!manualLengthHydrated && !ui.isRunning) {
+                        manualLengthHydrated = true
+                        formatManualInput(
+                            ui.selectedTrack?.manualLapLengthMeters
+                                ?: store.manualLapLengthMeters,
+                        )
+                    } else {
+                        ui.manualLapLengthInput
+                    }
+                    ui.copy(
                         knownTracks = store.knownTracks.sortedByDescending { t -> t.updatedAtMs },
+                        manualLapLengthInput = hydrated,
+                        selectedTrack = ui.selectedTrack?.id?.let { id ->
+                            store.knownTracks.find { it.id == id } ?: ui.selectedTrack
+                        },
                     )
                 }
             }
@@ -123,6 +149,7 @@ class RunViewModel(application: Application) : AndroidViewModel(application) {
                         hrSum += bpm
                         hrCount += 1
                         if (bpm > hrMax) hrMax = bpm
+                        hrTimeline += TimedSample(System.currentTimeMillis(), bpm)
                     }
                 }
                 _ui.update {
@@ -161,32 +188,50 @@ class RunViewModel(application: Application) : AndroidViewModel(application) {
 
     fun selectTrack(track: KnownTrack?) {
         if (_ui.value.isRunning) return
+        val global = repo.store.value.manualLapLengthMeters
+        val length = track?.manualLapLengthMeters ?: global
         _ui.update {
             it.copy(
                 selectedTrack = track,
-                manualLapLengthInput = track?.manualLapLengthMeters?.let { m ->
-                    if (m % 1.0 == 0.0) m.toInt().toString() else m.toString()
-                } ?: "",
+                manualLapLengthInput = formatManualInput(length),
                 statusText = if (track == null) {
-                    "Новый трек — круги подтвердятся с 3-го"
+                    "Новый трек — круг = возврат к точке Старта"
                 } else {
-                    "Трек «${track.name}» — счёт с первого круга"
+                    "Трек «${track.name}» — круг = возврат к точке Старта"
                 },
             )
         }
     }
 
     fun setManualLapLengthInput(value: String) {
-        _ui.update { it.copy(manualLapLengthInput = value.filter { ch -> ch.isDigit() || ch == '.' || ch == ',' }) }
+        val filtered = value.filter { ch -> ch.isDigit() || ch == '.' || ch == ',' }
+        _ui.update { it.copy(manualLapLengthInput = filtered) }
+        val meters = parseManualLength(filtered)
+        viewModelScope.launch {
+            repo.setManualLapLength(meters, trackId = _ui.value.selectedTrack?.id)
+        }
+    }
+
+    private fun formatManualInput(meters: Double?): String {
+        if (meters == null) return ""
+        return if (meters % 1.0 == 0.0) meters.toInt().toString() else meters.toString()
     }
 
     fun start() {
         if (_ui.value.isRunning) return
         val track = _ui.value.selectedTrack
-        detector = LapDetector(knownTemplate = track?.templatePoints())
+        detector = LapDetector(
+            knownTemplate = track?.templatePoints(),
+            lapLengthHintMeters = track?.let {
+                parseManualLength() ?: it.manualLapLengthMeters ?: repo.store.value.manualLapLengthMeters
+            },
+        )
         gpsFilter = GpsFilter(
             motionRms = { from, to -> LocationTrackingService.sharedMotion?.rmsBetween(from, to) },
         )
+        instantPace.reset()
+        rawLogPoints.clear()
+        hrTimeline.clear()
         startedAtMs = System.currentTimeMillis()
         accumulatedElapsedMs = 0L
         segmentStartedAtMs = startedAtMs
@@ -238,6 +283,7 @@ class RunViewModel(application: Application) : AndroidViewModel(application) {
                 gpsQuality = GpsQuality.ABSENT,
                 gpsAccuracyMeters = null,
                 paceMetricText = "—:—",
+                cadenceSpm = null,
             )
         }
         publishFromSnapshot(lastSnapshot ?: return)
@@ -265,13 +311,15 @@ class RunViewModel(application: Application) : AndroidViewModel(application) {
         // Flush buffered GPS point through filter → detector.
         gpsFilter?.flush()?.forEach { onFilteredPoint(it) }
 
-        val snap = lastSnapshot ?: detector?.snapshot()
+        val snap = detector?.finish() ?: lastSnapshot
         val det = detector
         val track = _ui.value.selectedTrack
         val manualLen = parseManualLength()
+            ?: track?.manualLapLengthMeters
+            ?: repo.store.value.manualLapLengthMeters
         val auto = snap?.let { it.phase == LapDetector.Phase.CONFIRMED } == true
         val distances = if (snap != null) {
-            DistanceCalculator.breakdown(snap, manualLen ?: track?.manualLapLengthMeters, auto)
+            DistanceCalculator.breakdown(snap, manualLen, auto)
         } else {
             DistanceBreakdown(0.0, null, null, 0, 0.0)
         }
@@ -281,7 +329,17 @@ class RunViewModel(application: Application) : AndroidViewModel(application) {
             (track != null && snap?.phase == LapDetector.Phase.CONFIRMED)
         // Persist filtered points (not raw GPS junk).
         val points = snap?.points.orEmpty()
-        val template = snap?.template
+        val runRing = det?.runRing()
+        val template = runRing?.template ?: snap?.template
+        val splits = snap?.lapSplits.orEmpty()
+        val cadence = LocationTrackingService.sharedCadence
+        val lapStats = LapStatsCalculator.build(
+            splits = splits,
+            points = points,
+            manualLapLengthMeters = manualLen,
+            heartSamples = hrTimeline.toList(),
+            cadenceByRange = { from, to -> cadence?.averageCadenceSpm(from, to) },
+        )
 
         val avgHr = if (hrCount > 0) (hrSum / hrCount).toInt() else null
         val maxHr = hrMax.takeIf { it > 0 }
@@ -312,10 +370,27 @@ class RunViewModel(application: Application) : AndroidViewModel(application) {
         // Unnamed start + confirmed laps → user decides; known start → auto-refine.
         val needsDecision = track == null && lapsConfirmed && template != null
 
+        val logPoints = rawLogPoints.toList()
         viewModelScope.launch {
             repo.addRun(run)
-            if (track != null && lapsConfirmed && template != null) {
-                repo.refineTrack(track.id, template)
+            runCatching {
+                runLogStore.save(
+                    startedAtMs = startedAtMs,
+                    endedAtMs = run.endedAtMs,
+                    elapsedMs = elapsed,
+                    completedLaps = run.completedLaps,
+                    lapsConfirmed = lapsConfirmed,
+                    trackName = track?.name,
+                    points = logPoints.ifEmpty { points },
+                )
+            }
+            if (track != null && lapsConfirmed && runRing != null) {
+                repo.refineTrack(
+                    trackId = track.id,
+                    newRing = runRing.template,
+                    lapsUsed = runRing.lapsUsed,
+                    manualLapLengthMeters = manualLen,
+                )
                 val manual = parseManualLength()
                 if (manual != null) {
                     repo.updateManualLength(track.id, manual)
@@ -325,6 +400,8 @@ class RunViewModel(application: Application) : AndroidViewModel(application) {
 
         detector = null
         gpsFilter = null
+        rawLogPoints.clear()
+        instantPace.reset()
         _ui.update {
             it.copy(
                 isRunning = false,
@@ -335,6 +412,7 @@ class RunViewModel(application: Application) : AndroidViewModel(application) {
                     needsTrackDecision = needsDecision,
                     ringTemplate = template,
                     gpx = gpx,
+                    lapStats = lapStats,
                 ),
                 statusText = when {
                     needsDecision -> "Круги найдены — сохраните трек"
@@ -352,7 +430,11 @@ class RunViewModel(application: Application) : AndroidViewModel(application) {
         if (!finished.needsTrackDecision || finished.decisionDone) return
         val template = finished.ringTemplate ?: return
         viewModelScope.launch {
-            val updated = repo.refineTrack(trackId, template)
+            val updated = repo.refineTrack(
+                trackId = trackId,
+                newRing = template,
+                manualLapLengthMeters = parseManualLength(),
+            )
             val manual = parseManualLength()
             if (manual != null) {
                 repo.updateManualLength(trackId, manual)
@@ -436,10 +518,13 @@ class RunViewModel(application: Application) : AndroidViewModel(application) {
 
     private fun onPoint(point: GeoPoint) {
         lastGpsAtMs = System.currentTimeMillis()
+        rawLogPoints += point
+        instantPace.onFix(point)
         _ui.update {
             it.copy(
                 gpsQuality = classifyGps(point.accuracyMeters, fresh = true),
                 gpsAccuracyMeters = point.accuracyMeters,
+                paceMetricText = instantPace.paceMetricText(),
             )
         }
         val filter = gpsFilter ?: return
@@ -467,7 +552,9 @@ class RunViewModel(application: Application) : AndroidViewModel(application) {
 
     private fun publishFromSnapshot(snap: LapDetector.Snapshot) {
         val track = _ui.value.selectedTrack
-        val manualLen = parseManualLength() ?: track?.manualLapLengthMeters
+        val manualLen = parseManualLength()
+            ?: track?.manualLapLengthMeters
+            ?: repo.store.value.manualLapLengthMeters
         val auto = snap.phase == LapDetector.Phase.CONFIRMED
         val distances = DistanceCalculator.breakdown(snap, manualLen, auto)
         val elapsed = currentElapsedMs()
@@ -495,9 +582,8 @@ class RunViewModel(application: Application) : AndroidViewModel(application) {
                 paceComputed = PaceCalculator.formatPace(
                     distances.computedMeters?.let { m -> PaceCalculator.paceSecPerKm(m, elapsed) }
                 ),
-                paceMetricText = PaceCalculator.formatPaceCore(
-                    PaceCalculator.paceSecPerKm(distances.gpsMeters, elapsed)
-                ) ?: "—:—",
+                paceMetricText = instantPace.paceMetricText(),
+                cadenceSpm = LocationTrackingService.sharedCadence?.cadenceSpm(),
                 statusText = if (it.isPaused) "Пауза" else status,
             )
         }
@@ -519,9 +605,8 @@ class RunViewModel(application: Application) : AndroidViewModel(application) {
                 paceComputed = PaceCalculator.formatPace(
                     d.computedMeters?.let { m -> PaceCalculator.paceSecPerKm(m, elapsed) }
                 ),
-                paceMetricText = PaceCalculator.formatPaceCore(
-                    PaceCalculator.paceSecPerKm(d.gpsMeters, elapsed)
-                ) ?: "—:—",
+                paceMetricText = instantPace.paceMetricText(),
+                cadenceSpm = LocationTrackingService.sharedCadence?.cadenceSpm(),
                 gpsQuality = classifyGps(it.gpsAccuracyMeters, fresh = gpsFresh),
             )
         }
@@ -536,8 +621,8 @@ class RunViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    private fun parseManualLength(): Double? {
-        val raw = _ui.value.manualLapLengthInput.replace(',', '.').trim()
+    private fun parseManualLength(rawInput: String = _ui.value.manualLapLengthInput): Double? {
+        val raw = rawInput.replace(',', '.').trim()
         if (raw.isEmpty()) return null
         return raw.toDoubleOrNull()?.takeIf { it in 50.0..100_000.0 }
     }

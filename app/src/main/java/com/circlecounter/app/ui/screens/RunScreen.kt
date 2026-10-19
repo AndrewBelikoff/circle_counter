@@ -15,6 +15,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.DirectionsRun
 import androidx.compose.material.icons.filled.Favorite
 import androidx.compose.material.icons.filled.SatelliteAlt
 import androidx.compose.material.icons.filled.Speed
@@ -51,7 +52,7 @@ fun RunScreen(
 ) {
     val onBg = MaterialTheme.colorScheme.onBackground
     val secondary = MaterialTheme.colorScheme.secondary
-    val metricFont = 34.sp
+    val metricFont = 30.sp
 
     Column(
         modifier = Modifier
@@ -136,7 +137,7 @@ fun RunScreen(
             IconMetric(
                 modifier = Modifier.weight(1f),
                 value = state.paceMetricText,
-                caption = "мин/км",
+                caption = "мин/км · сейчас",
                 fontSize = metricFont,
                 contentColor = onBg,
                 icon = {
@@ -163,19 +164,43 @@ fun RunScreen(
             )
         }
 
-        Spacer(Modifier.height(16.dp))
+        Spacer(Modifier.height(10.dp))
+
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            IconMetric(
+                modifier = Modifier.weight(1f),
+                value = state.cadenceSpm?.toString() ?: "—",
+                caption = "шаг/мин",
+                fontSize = metricFont,
+                contentColor = onBg,
+                icon = {
+                    Icon(
+                        imageVector = Icons.AutoMirrored.Filled.DirectionsRun,
+                        contentDescription = null,
+                        tint = onBg.copy(alpha = 0.22f),
+                        modifier = Modifier.fillMaxSize(),
+                    )
+                },
+            )
+            Spacer(Modifier.weight(1f))
+        }
+
+        Spacer(Modifier.height(12.dp))
 
         MetricBlock(title = "Темп") {
-            Text("GPS: ${state.paceGps}")
-            Text("Ручная длина: ${state.paceManual}")
-            Text("Длина трека: ${state.paceComputed}")
+            Text("GPS: ${state.paceGps}", color = onBg)
+            Text("Ручная длина: ${state.paceManual}", color = onBg)
+            Text("Длина трека: ${state.paceComputed}", color = onBg)
         }
 
         if (state.autoCountActive) {
-            Spacer(Modifier.height(12.dp))
+            Spacer(Modifier.height(10.dp))
             MetricBlock(title = "Расстояние по кругам") {
-                Text("Ручная: ${DistanceFormatter.formatKmM(state.distances.manualMeters)}")
-                Text("По треку: ${DistanceFormatter.formatKmM(state.distances.computedMeters)}")
+                Text("Ручная: ${DistanceFormatter.formatKmM(state.distances.manualMeters)}", color = onBg)
+                Text("По треку: ${DistanceFormatter.formatKmM(state.distances.computedMeters)}", color = onBg)
             }
         }
 

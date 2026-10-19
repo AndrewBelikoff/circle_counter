@@ -26,6 +26,7 @@ import kotlinx.coroutines.flow.asSharedFlow
 class LocationTrackingService : Service() {
     private val fused by lazy { LocationServices.getFusedLocationProviderClient(this) }
     private val motionTracker = MotionTracker()
+    private val cadenceTracker = CadenceTracker()
 
     private val callback = object : LocationCallback() {
         override fun onLocationResult(result: LocationResult) {
@@ -35,6 +36,7 @@ class LocationTrackingService : Service() {
                 longitude = loc.longitude,
                 timestampMs = loc.time.takeIf { it > 0 } ?: System.currentTimeMillis(),
                 accuracyMeters = if (loc.hasAccuracy()) loc.accuracy else null,
+                speedMps = if (loc.hasSpeed() && loc.speed >= 0f) loc.speed else null,
             )
             _points.tryEmit(point)
         }
@@ -48,7 +50,9 @@ class LocationTrackingService : Service() {
         startForeground(NOTIFICATION_ID, buildNotification())
         val sm = getSystemService(Context.SENSOR_SERVICE) as SensorManager
         motionTracker.start(sm)
+        cadenceTracker.start(sm)
         sharedMotion = motionTracker
+        sharedCadence = cadenceTracker
         startUpdates()
     }
 
@@ -66,7 +70,9 @@ class LocationTrackingService : Service() {
     override fun onDestroy() {
         stopUpdates()
         motionTracker.stop()
+        cadenceTracker.stop()
         if (sharedMotion === motionTracker) sharedMotion = null
+        if (sharedCadence === cadenceTracker) sharedCadence = null
         super.onDestroy()
     }
 
@@ -123,6 +129,10 @@ class LocationTrackingService : Service() {
 
         @Volatile
         var sharedMotion: MotionTracker? = null
+            private set
+
+        @Volatile
+        var sharedCadence: CadenceTracker? = null
             private set
     }
 }

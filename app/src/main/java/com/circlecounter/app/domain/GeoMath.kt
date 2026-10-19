@@ -112,26 +112,127 @@ object GeoMath {
         return sum / ra.size
     }
 
+    /** Length of a closed ring stored as an open polyline (includes last → first). */
+    fun ringLengthMeters(ring: List<GeoPoint>): Double {
+        if (ring.size < 2) return 0.0
+        return pathLengthMeters(ring) + haversineMeters(ring.last(), ring.first())
+    }
+
     /**
-     * Average corresponding points of several similar loops into one template.
+     * Resample a loop to [count] points evenly spaced along the closed ring
+     * (the last → first segment is part of the ring, no duplicated vertex).
      */
-    fun averagePaths(paths: List<List<GeoPoint>>, samples: Int = 64): List<GeoPoint> {
-        require(paths.isNotEmpty())
-        val resampled = paths.map { resampleByDistance(it, samples) }
-        val averaged = List(samples) { i ->
-            var lat = 0.0
-            var lon = 0.0
-            for (path in resampled) {
-                lat += path[i].latitude
-                lon += path[i].longitude
-            }
-            GeoPoint(lat / resampled.size, lon / resampled.size)
+    fun resampleClosedRing(points: List<GeoPoint>, count: Int): List<GeoPoint> {
+        require(count >= 3)
+        if (points.size < 2) return resampleByDistance(points, count)
+        val closed = points + points.first()
+        val segmentLengths = DoubleArray(closed.size - 1)
+        var total = 0.0
+        for (i in 1 until closed.size) {
+            val d = haversineMeters(closed[i - 1], closed[i])
+            segmentLengths[i - 1] = d
+            total += d
         }
-        // Out-of-phase averages collapse toward the centroid — keep the longest source.
-        val avgLen = pathLengthMeters(averaged)
-        val best = resampled.maxBy { pathLengthMeters(it) }
-        val bestLen = pathLengthMeters(best)
-        return if (bestLen > 1.0 && avgLen < bestLen * 0.55) best else averaged
+        if (total <= 1e-3) return List(count) { points.first() }
+        return List(count) { i -> pointAtDistance(closed, segmentLengths, total * i / count) }
+    }
+
+    /**
+     * Rotate/reverse [ring] so that index i lies at the same place of the loop as
+     * [reference][i]. Both must be closed-ring resamples of equal size.
+     * Without this, laps started at different places average toward the centroid
+     * and the ring shrinks.
+     */
+    fun alignRing(reference: List<GeoPoint>, ring: List<GeoPoint>): List<GeoPoint> {
+        val n = reference.size
+        require(ring.size == n && n >= 3)
+        val lat0 = reference.sumOf { it.latitude } / n
+        val kx = 111_320.0 * cos(Math.toRadians(lat0))
+        val ky = 111_320.0
+        val rx = DoubleArray(n) { reference[it].longitude * kx }
+        val ry = DoubleArray(n) { reference[it].latitude * ky }
+
+        var best = ring
+        var bestCost = Double.POSITIVE_INFINITY
+        for (candidate in listOf(ring, ring.reversed())) {
+            val cx = DoubleArray(n) { candidate[it].longitude * kx }
+            val cy = DoubleArray(n) { candidate[it].latitude * ky }
+            for (shift in 0 until n) {
+                var cost = 0.0
+                for (i in 0 until n) {
+                    val j = (i + shift) % n
+                    val dx = rx[i] - cx[j]
+                    val dy = ry[i] - cy[j]
+                    cost += dx * dx + dy * dy
+                    if (cost >= bestCost) break
+                }
+                if (cost < bestCost) {
+                    bestCost = cost
+                    best = List(n) { candidate[(it + shift) % n] }
+                }
+            }
+        }
+        return best
+    }
+
+    /**
+     * Phase-aligned average of several laps of the same ring.
+     * [weights] defaults to equal; [robust] uses a per-point weighted median
+     * (resists single GPS-drifted laps).
+     */
+    fun averageRings(
+        paths: List<List<GeoPoint>>,
+        samples: Int = 64,
+        weights: List<Double>? = null,
+        robust: Boolean = false,
+    ): List<GeoPoint> {
+        require(paths.isNotEmpty())
+        require(weights == null || weights.size == paths.size)
+        val w = weights ?: List(paths.size) { 1.0 }
+        val rings = paths.map { resampleClosedRing(it, samples) }
+        if (rings.size == 1) return rings.first()
+
+        var reference = rings[w.indices.maxBy { w[it] }]
+        var result = reference
+        // Second pass re-aligns to the consensus so the first lap does not bias the shape.
+        repeat(2) {
+            val aligned = rings.map { alignRing(reference, it) }
+            result = List(samples) { i ->
+                if (robust && aligned.size >= 3) {
+                    GeoPoint(
+                        latitude = weightedMedian(aligned.map { it[i].latitude }, w),
+                        longitude = weightedMedian(aligned.map { it[i].longitude }, w),
+                    )
+                } else {
+                    val sw = w.sum()
+                    GeoPoint(
+                        latitude = aligned.indices.sumOf { aligned[it][i].latitude * w[it] } / sw,
+                        longitude = aligned.indices.sumOf { aligned[it][i].longitude * w[it] } / sw,
+                    )
+                }
+            }
+            reference = result
+        }
+        return result
+    }
+
+    private fun weightedMedian(values: List<Double>, weights: List<Double>): Double {
+        val order = values.indices.sortedBy { values[it] }
+        val half = weights.sum() / 2
+        var acc = 0.0
+        for (idx in order) {
+            acc += weights[idx]
+            if (acc >= half) return values[idx]
+        }
+        return values[order.last()]
+    }
+
+    /** Value at the middle of a sorted list; null if empty. */
+    fun median(values: List<Double>): Double? {
+        if (values.isEmpty()) return null
+        val s = values.sorted()
+        val m = s.size / 2
+        return if (s.size % 2 == 1) s[m] else (s[m - 1] + s[m]) / 2
     }
 
     /**
