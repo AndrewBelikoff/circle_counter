@@ -55,7 +55,11 @@ data class SavedRun(
     val gpsDistanceMeters: Double,
     val manualDistanceMeters: Double?,
     val computedDistanceMeters: Double?,
-    val points: List<StoredPoint>,
+    /**
+     * Legacy polyline. New runs keep points only in `run_logs`; this list is
+     * cleared on load so the store is not rewritten as a multi-megabyte file.
+     */
+    val points: List<StoredPoint> = emptyList(),
     val avgHeartRateBpm: Int? = null,
     val maxHeartRateBpm: Int? = null,
 )

@@ -19,8 +19,11 @@ import androidx.core.content.ContextCompat
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
@@ -43,6 +46,8 @@ enum class HrConnectionState {
     BT_OFF,
 }
 
+data class HeartSample(val tMs: Long, val bpm: Int)
+
 data class HeartRateState(
     val connection: HrConnectionState = HrConnectionState.IDLE,
     val bpm: Int? = null,
@@ -62,6 +67,12 @@ class HeartRateManager(
 
     private val _state = MutableStateFlow(HeartRateState())
     val state: StateFlow<HeartRateState> = _state.asStateFlow()
+
+    /** One sample per notification, including a repeated bpm. StateFlow would drop those. */
+    private val _samples = MutableSharedFlow<HeartSample>(extraBufferCapacity = 64)
+    val samples: SharedFlow<HeartSample> = _samples.asSharedFlow()
+    private var lastSampleMs = 0L
+    private var lastSampleBpm = -1
 
     private var gatt: BluetoothGatt? = null
     private var scanJob: Job? = null
@@ -432,6 +443,11 @@ class HeartRateManager(
 
     private fun onHrBytes(value: ByteArray) {
         val bpm = HeartRateParser.parseBpm(value) ?: return
+        val now = System.currentTimeMillis()
+        // API 33+ can deliver the same notification through both callbacks.
+        if (bpm == lastSampleBpm && now - lastSampleMs < DUPLICATE_WINDOW_MS) return
+        lastSampleMs = now
+        lastSampleBpm = bpm
         _state.update {
             it.copy(
                 connection = HrConnectionState.CONNECTED,
@@ -439,6 +455,7 @@ class HeartRateManager(
                 statusText = "Пульс: $bpm",
             )
         }
+        _samples.tryEmit(HeartSample(now, bpm))
     }
 
     private fun scheduleReconnect() {
@@ -479,5 +496,6 @@ class HeartRateManager(
         val HR_SERVICE: UUID = UUID.fromString("0000180d-0000-1000-8000-00805f9b34fb")
         val HR_MEASUREMENT: UUID = UUID.fromString("00002a37-0000-1000-8000-00805f9b34fb")
         val CCCD: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
+        private const val DUPLICATE_WINDOW_MS = 400L
     }
 }

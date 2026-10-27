@@ -27,6 +27,29 @@ object GeoMath {
         return sum
     }
 
+    /** Share of [path] samples that come within [radiusMeters] of [ring]. */
+    fun fractionNearRing(
+        path: List<GeoPoint>,
+        ring: List<GeoPoint>,
+        radiusMeters: Double,
+        samples: Int = 36,
+    ): Double {
+        if (path.size < 2 || ring.size < 3) return 0.0
+        val rail = resampleClosedRing(ring, 64)
+        val probe = resampleByDistance(path, samples)
+        var near = 0
+        for (p in probe) {
+            var best = Double.POSITIVE_INFINITY
+            for (c in rail) {
+                val d = haversineMeters(p, c)
+                if (d < best) best = d
+                if (best <= radiusMeters) break
+            }
+            if (best <= radiusMeters) near++
+        }
+        return near.toDouble() / probe.size
+    }
+
     /**
      * Spatial span of a path (bbox diagonal). Used to reject collapsed "loops"
      * whose GPS arc length is long from zig-zag but the ring is tiny.

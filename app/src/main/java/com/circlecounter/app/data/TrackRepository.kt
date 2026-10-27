@@ -7,6 +7,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
@@ -25,17 +27,44 @@ class TrackRepository(context: Context) {
 
     private val _store = MutableStateFlow(loadSync())
     val store: StateFlow<AppStore> = _store.asStateFlow()
+    private val writeMutex = Mutex()
+    private var compactPending = false
 
     private fun loadSync(): AppStore {
         if (!file.exists()) return AppStore()
-        return runCatching {
+        val raw = runCatching {
             json.decodeFromString<AppStore>(file.readText())
-        }.getOrElse { AppStore() }
+        }.getOrElse { return AppStore() }
+        compactPending = raw.runs.any { it.points.isNotEmpty() }
+        return raw.copy(runs = raw.runs.map { it.copy(points = emptyList()) })
+    }
+
+    /** One writer at a time. [transform] returns null to leave the file unchanged. */
+    private suspend fun mutate(transform: (AppStore) -> AppStore?) {
+        writeMutex.withLock {
+            val next = transform(_store.value)?.let { stripPoints(it) } ?: return
+            persist(next)
+        }
+    }
+
+    private fun stripPoints(store: AppStore): AppStore {
+        if (store.runs.all { it.points.isEmpty() }) return store
+        return store.copy(runs = store.runs.map { it.copy(points = emptyList()) })
     }
 
     private suspend fun persist(store: AppStore) = withContext(Dispatchers.IO) {
         file.writeText(json.encodeToString(store))
         _store.value = store
+    }
+
+    /** Rewrite the store once if an older version still had full GPS polylines on disk. */
+    suspend fun compactIfNeeded() {
+        if (!compactPending) return
+        writeMutex.withLock {
+            if (!compactPending) return
+            persist(stripPoints(_store.value))
+            compactPending = false
+        }
     }
 
     /** Freshest first (updatedAtMs desc). */
@@ -64,13 +93,14 @@ class TrackRepository(context: Context) {
             updatedAtMs = now,
             autoNamed = autoNamed,
         )
-        val store = _store.value
-        var list = store.knownTracks + track
-        if (autoNamed) {
-            list = pruneAutoNamed(list)
+        var saved = track
+        mutate { store ->
+            var list = store.knownTracks + track
+            if (autoNamed) list = pruneAutoNamed(list)
+            saved = list.find { it.id == track.id } ?: track
+            store.copy(knownTracks = list)
         }
-        persist(store.copy(knownTracks = list))
-        return track
+        return saved
     }
 
     /**
@@ -86,110 +116,126 @@ class TrackRepository(context: Context) {
         lapsUsed: Int = 1,
         manualLapLengthMeters: Double? = null,
     ): KnownTrack? {
-        val store = _store.value
-        val idx = store.knownTracks.indexOfFirst { it.id == trackId }
-        if (idx < 0) return null
-        val old = store.knownTracks[idx]
-        val manual = manualLapLengthMeters ?: old.manualLapLengthMeters
-        fun fitsManual(len: Double) =
-            manual == null || len in manual * MANUAL_FIT_MIN..manual * MANUAL_FIT_MAX
+        var result: KnownTrack? = null
+        mutate { store ->
+            val idx = store.knownTracks.indexOfFirst { it.id == trackId }
+            if (idx < 0) return@mutate null
+            val old = store.knownTracks[idx]
+            val manual = manualLapLengthMeters ?: old.manualLapLengthMeters
+            fun fitsManual(len: Double) =
+                manual == null || len in manual * MANUAL_FIT_MIN..manual * MANUAL_FIT_MAX
 
-        val oldRing = old.templatePoints()
-        val newLen = GeoMath.ringLengthMeters(newRing)
-        val merged = when {
-            newRing.size < 3 || !fitsManual(newLen) -> oldRing
-            oldRing.size < 3 || !fitsManual(GeoMath.ringLengthMeters(oldRing)) ->
-                GeoMath.resampleClosedRing(newRing, TEMPLATE_SAMPLES)
-            else -> GeoMath.averageRings(
-                listOf(oldRing, newRing),
-                samples = TEMPLATE_SAMPLES,
-                weights = listOf(
-                    old.runCount.coerceIn(1, MAX_HISTORY_WEIGHT).toDouble(),
-                    (lapsUsed / 4.0).coerceIn(0.5, 2.0),
-                ),
+            val oldRing = old.templatePoints()
+            val newLen = GeoMath.ringLengthMeters(newRing)
+            // A ring that disagrees with the manual length must not gain history weight.
+            val merged: List<GeoPoint>? = when {
+                newRing.size < 3 || !fitsManual(newLen) -> null
+                oldRing.size < 3 || !fitsManual(GeoMath.ringLengthMeters(oldRing)) ->
+                    GeoMath.resampleClosedRing(newRing, TEMPLATE_SAMPLES)
+                else -> GeoMath.averageRings(
+                    listOf(oldRing, newRing),
+                    samples = TEMPLATE_SAMPLES,
+                    weights = listOf(
+                        old.runCount.coerceIn(1, MAX_HISTORY_WEIGHT).toDouble(),
+                        (lapsUsed / 4.0).coerceIn(0.5, 2.0),
+                    ),
+                )
+            }
+            if (merged == null) {
+                result = old
+                return@mutate null
+            }
+            val updated = old.copy(
+                template = merged.map { StoredPoint.from(it) },
+                computedLapLengthMeters = GeoMath.ringLengthMeters(merged),
+                runCount = old.runCount + 1,
+                updatedAtMs = System.currentTimeMillis(),
             )
+            result = updated
+            val list = store.knownTracks.toMutableList()
+            list[idx] = updated
+            store.copy(knownTracks = list)
         }
-        val updated = old.copy(
-            template = merged.map { StoredPoint.from(it) },
-            computedLapLengthMeters = GeoMath.ringLengthMeters(merged),
-            runCount = old.runCount + 1,
-            updatedAtMs = System.currentTimeMillis(),
-        )
-        val list = store.knownTracks.toMutableList()
-        list[idx] = updated
-        persist(store.copy(knownTracks = list))
-        return updated
+        return result
     }
 
     suspend fun updateManualLength(trackId: String, meters: Double?) {
-        val store = _store.value
-        val list = store.knownTracks.map {
-            if (it.id == trackId) it.copy(
-                manualLapLengthMeters = meters,
-                updatedAtMs = System.currentTimeMillis(),
-            ) else it
+        mutate { store ->
+            val list = store.knownTracks.map {
+                if (it.id == trackId) it.copy(
+                    manualLapLengthMeters = meters,
+                    updatedAtMs = System.currentTimeMillis(),
+                ) else it
+            }
+            store.copy(knownTracks = list)
         }
-        persist(store.copy(knownTracks = list))
     }
 
     /** Rename; giving a custom name clears [KnownTrack.autoNamed]. */
     suspend fun renameTrack(trackId: String, name: String) {
         val trimmed = name.trim()
         if (trimmed.isEmpty()) return
-        val store = _store.value
-        val list = store.knownTracks.map {
-            if (it.id == trackId) it.copy(
-                name = trimmed,
-                autoNamed = false,
-                updatedAtMs = System.currentTimeMillis(),
-            ) else it
+        mutate { store ->
+            val list = store.knownTracks.map {
+                if (it.id == trackId) it.copy(
+                    name = trimmed,
+                    autoNamed = false,
+                    updatedAtMs = System.currentTimeMillis(),
+                ) else it
+            }
+            store.copy(knownTracks = list)
         }
-        persist(store.copy(knownTracks = list))
     }
 
     suspend fun deleteTrack(trackId: String) {
-        val store = _store.value
-        persist(store.copy(knownTracks = store.knownTracks.filterNot { it.id == trackId }))
+        mutate { store ->
+            store.copy(knownTracks = store.knownTracks.filterNot { it.id == trackId })
+        }
     }
 
     suspend fun addRun(run: SavedRun) {
-        val store = _store.value
-        persist(store.copy(runs = (listOf(run) + store.runs).take(100)))
+        mutate { store ->
+            val slim = run.copy(points = emptyList())
+            store.copy(runs = (listOf(slim) + store.runs).take(MAX_SAVED_RUNS))
+        }
     }
 
     suspend fun setPreferredHrSensor(address: String?, name: String?) {
-        val store = _store.value
-        val sensor = if (address != null) {
-            PreferredHrSensor(address = address, name = name?.ifBlank { address } ?: address)
-        } else {
-            null
+        mutate { store ->
+            val sensor = if (address != null) {
+                PreferredHrSensor(address = address, name = name?.ifBlank { address } ?: address)
+            } else {
+                null
+            }
+            store.copy(preferredHrSensor = sensor)
         }
-        persist(store.copy(preferredHrSensor = sensor))
     }
 
     /** Persist global manual lap length; also stamps the selected track when [trackId] is set. */
     suspend fun setManualLapLength(meters: Double?, trackId: String? = null) {
-        val store = _store.value
-        val tracks = if (trackId != null) {
-            store.knownTracks.map {
-                if (it.id == trackId) {
-                    it.copy(
-                        manualLapLengthMeters = meters,
-                        updatedAtMs = System.currentTimeMillis(),
-                    )
-                } else {
-                    it
+        mutate { store ->
+            val tracks = if (trackId != null) {
+                store.knownTracks.map {
+                    if (it.id == trackId) {
+                        it.copy(
+                            manualLapLengthMeters = meters,
+                            updatedAtMs = System.currentTimeMillis(),
+                        )
+                    } else {
+                        it
+                    }
                 }
+            } else {
+                store.knownTracks
             }
-        } else {
-            store.knownTracks
+            store.copy(manualLapLengthMeters = meters, knownTracks = tracks)
         }
-        persist(store.copy(manualLapLengthMeters = meters, knownTracks = tracks))
     }
 
     companion object {
         private const val TEMPLATE_SAMPLES = 64
         private const val MAX_HISTORY_WEIGHT = 6
+        private const val MAX_SAVED_RUNS = 100
         private const val MANUAL_FIT_MIN = 0.85
         private const val MANUAL_FIT_MAX = 1.15
 

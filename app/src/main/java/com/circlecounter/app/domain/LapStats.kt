@@ -1,5 +1,7 @@
 package com.circlecounter.app.domain
 
+import kotlin.math.roundToInt
+
 /** Boundary of a completed lap inside the GPS point list. */
 data class LapSplit(
     val lapNumber: Int,
@@ -52,11 +54,34 @@ object LapStatsCalculator {
                 manualDistanceMeters = manualLapLengthMeters,
                 speedGpsKmh = speedKmh(gpsDist, elapsed),
                 speedManualKmh = manualLapLengthMeters?.let { speedKmh(it, elapsed) },
-                avgHeartRateBpm = hrInLap.takeIf { it.isNotEmpty() }?.map { it.value }?.average()?.toInt(),
+                avgHeartRateBpm = timeWeightedBpm(hrInLap, split.startTimestampMs, split.endTimestampMs),
                 maxHeartRateBpm = hrInLap.maxOfOrNull { it.value },
                 avgCadenceSpm = cadenceByRange(split.startTimestampMs, split.endTimestampMs),
             )
         }
+    }
+
+    /**
+     * Average bpm weighted by how long each sample stayed current.
+     * A value that holds for 10 s counts more than a one-second spike.
+     */
+    fun timeWeightedBpm(samples: List<TimedSample>, fromMs: Long, toMs: Long): Int? {
+        val relevant = samples.filter { it.tMs in fromMs..toMs }
+        if (relevant.isEmpty()) return null
+        if (relevant.size == 1) return relevant[0].value
+        var acc = 0.0
+        var weight = 0.0
+        for (i in 0 until relevant.lastIndex) {
+            val dt = (relevant[i + 1].tMs - relevant[i].tMs).toDouble().coerceIn(0.0, 15_000.0)
+            acc += relevant[i].value * dt
+            weight += dt
+        }
+        val tail = (toMs - relevant.last().tMs).toDouble().coerceIn(0.0, 15_000.0)
+            .takeIf { it >= 1.0 } ?: 1_000.0
+        acc += relevant.last().value * tail
+        weight += tail
+        if (weight < 1.0) return relevant.last().value
+        return (acc / weight).roundToInt()
     }
 
     fun speedKmh(meters: Double, elapsedMs: Long): Double? {

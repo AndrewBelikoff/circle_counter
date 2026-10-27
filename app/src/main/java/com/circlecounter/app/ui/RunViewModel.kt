@@ -22,6 +22,7 @@ import com.circlecounter.app.domain.LapDetector
 import com.circlecounter.app.domain.LapStat
 import com.circlecounter.app.domain.LapStatsCalculator
 import com.circlecounter.app.domain.PaceCalculator
+import com.circlecounter.app.domain.StartGateWarmup
 import com.circlecounter.app.domain.TimedSample
 import com.circlecounter.app.hr.HeartRateManager
 import com.circlecounter.app.hr.HeartRateState
@@ -102,11 +103,10 @@ class RunViewModel(application: Application) : AndroidViewModel(application) {
     private var accumulatedElapsedMs = 0L
     private var segmentStartedAtMs = 0L
     private var lastSnapshot: LapDetector.Snapshot? = null
-    private var hrSum = 0L
-    private var hrCount = 0
     private var hrMax = 0
     private var lastGpsAtMs = 0L
     private val instantPace = InstantPaceEstimator()
+    private val gateWarmup = StartGateWarmup()
     private val rawLogPoints = mutableListOf<GeoPoint>()
     private val hrTimeline = mutableListOf<TimedSample>()
     private var manualLengthHydrated = false
@@ -118,6 +118,7 @@ class RunViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     init {
+        viewModelScope.launch { repo.compactIfNeeded() }
         viewModelScope.launch {
             repo.store.collect { store ->
                 val preferred = store.preferredHrSensor
@@ -144,18 +145,18 @@ class RunViewModel(application: Application) : AndroidViewModel(application) {
         }
         viewModelScope.launch {
             heartRateManager.state.collect { hr ->
-                if (_ui.value.isRunning && !_ui.value.isPaused) {
-                    hr.bpm?.let { bpm ->
-                        hrSum += bpm
-                        hrCount += 1
-                        if (bpm > hrMax) hrMax = bpm
-                        hrTimeline += TimedSample(System.currentTimeMillis(), bpm)
-                    }
-                }
+                _ui.update { it.copy(heartRate = hr) }
+            }
+        }
+        viewModelScope.launch {
+            heartRateManager.samples.collect { sample ->
+                if (!_ui.value.isRunning || _ui.value.isPaused) return@collect
+                if (sample.bpm > hrMax) hrMax = sample.bpm
+                hrTimeline += TimedSample(sample.tMs, sample.bpm)
+                val avg = LapStatsCalculator.timeWeightedBpm(hrTimeline, startedAtMs, sample.tMs)
                 _ui.update {
                     it.copy(
-                        heartRate = hr,
-                        avgHeartRateBpm = if (hrCount > 0) (hrSum / hrCount).toInt() else null,
+                        avgHeartRateBpm = avg,
                         maxHeartRateBpm = hrMax.takeIf { m -> m > 0 },
                     )
                 }
@@ -206,7 +207,10 @@ class RunViewModel(application: Application) : AndroidViewModel(application) {
     fun setManualLapLengthInput(value: String) {
         val filtered = value.filter { ch -> ch.isDigit() || ch == '.' || ch == ',' }
         _ui.update { it.copy(manualLapLengthInput = filtered) }
+        val trimmed = filtered.trim()
         val meters = parseManualLength(filtered)
+        // "4" and "40" are not lengths yet — don't wipe the saved 400 while typing.
+        if (trimmed.isNotEmpty() && meters == null) return
         viewModelScope.launch {
             repo.setManualLapLength(meters, trackId = _ui.value.selectedTrack?.id)
         }
@@ -220,24 +224,24 @@ class RunViewModel(application: Application) : AndroidViewModel(application) {
     fun start() {
         if (_ui.value.isRunning) return
         val track = _ui.value.selectedTrack
+        val manualHint = parseManualLength()
+            ?: track?.manualLapLengthMeters
+            ?: repo.store.value.manualLapLengthMeters
         detector = LapDetector(
             knownTemplate = track?.templatePoints(),
-            lapLengthHintMeters = track?.let {
-                parseManualLength() ?: it.manualLapLengthMeters ?: repo.store.value.manualLapLengthMeters
-            },
+            lapLengthHintMeters = manualHint,
         )
         gpsFilter = GpsFilter(
             motionRms = { from, to -> LocationTrackingService.sharedMotion?.rmsBetween(from, to) },
         )
         instantPace.reset()
+        gateWarmup.reset()
         rawLogPoints.clear()
         hrTimeline.clear()
         startedAtMs = System.currentTimeMillis()
         accumulatedElapsedMs = 0L
         segmentStartedAtMs = startedAtMs
         lastSnapshot = detector?.snapshot()
-        hrSum = 0L
-        hrCount = 0
         hrMax = 0
 
         val app = getApplication<Application>()
@@ -257,7 +261,6 @@ class RunViewModel(application: Application) : AndroidViewModel(application) {
         pointsJob?.cancel()
         pointsJob = viewModelScope.launch {
             LocationTrackingService.points.collect { point ->
-                if (_ui.value.isPaused) return@collect
                 onPoint(point)
             }
         }
@@ -308,8 +311,14 @@ class RunViewModel(application: Application) : AndroidViewModel(application) {
         tickerJob?.cancel()
         stopLocationService()
 
-        // Flush buffered GPS point through filter → detector.
-        gpsFilter?.flush()?.forEach { onFilteredPoint(it) }
+        // Flush warmup and the filter's held point into the detector.
+        val filter = gpsFilter
+        if (filter != null) {
+            for (raw in gateWarmup.flush()) {
+                for (accepted in filter.offer(raw)) onFilteredPoint(accepted)
+            }
+            filter.flush().forEach { onFilteredPoint(it) }
+        }
 
         val snap = detector?.finish() ?: lastSnapshot
         val det = detector
@@ -341,7 +350,11 @@ class RunViewModel(application: Application) : AndroidViewModel(application) {
             cadenceByRange = { from, to -> cadence?.averageCadenceSpm(from, to) },
         )
 
-        val avgHr = if (hrCount > 0) (hrSum / hrCount).toInt() else null
+        val avgHr = LapStatsCalculator.timeWeightedBpm(
+            hrTimeline,
+            startedAtMs,
+            System.currentTimeMillis(),
+        )
         val maxHr = hrMax.takeIf { it > 0 }
 
         val run = SavedRun(
@@ -371,6 +384,7 @@ class RunViewModel(application: Application) : AndroidViewModel(application) {
         val needsDecision = track == null && lapsConfirmed && template != null
 
         val logPoints = rawLogPoints.toList()
+        val logHeart = hrTimeline.toList()
         viewModelScope.launch {
             repo.addRun(run)
             runCatching {
@@ -382,6 +396,7 @@ class RunViewModel(application: Application) : AndroidViewModel(application) {
                     lapsConfirmed = lapsConfirmed,
                     trackName = track?.name,
                     points = logPoints.ifEmpty { points },
+                    heartSamples = logHeart,
                 )
             }
             if (track != null && lapsConfirmed && runRing != null) {
@@ -528,8 +543,10 @@ class RunViewModel(application: Application) : AndroidViewModel(application) {
             )
         }
         val filter = gpsFilter ?: return
-        for (accepted in filter.offer(point)) {
-            onFilteredPoint(accepted)
+        for (raw in gateWarmup.offer(point)) {
+            for (accepted in filter.offer(raw)) {
+                onFilteredPoint(accepted)
+            }
         }
     }
 

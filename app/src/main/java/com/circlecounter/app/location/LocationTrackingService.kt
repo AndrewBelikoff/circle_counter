@@ -64,7 +64,8 @@ class LocationTrackingService : Service() {
                 stopSelf()
             }
         }
-        return START_STICKY
+        // Do not resurrect GPS after the process dies — that recorded with no run on screen.
+        return START_NOT_STICKY
     }
 
     override fun onDestroy() {

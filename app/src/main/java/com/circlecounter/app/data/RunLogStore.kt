@@ -2,6 +2,7 @@ package com.circlecounter.app.data
 
 import android.content.Context
 import com.circlecounter.app.domain.GeoPoint
+import com.circlecounter.app.domain.TimedSample
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
@@ -27,9 +28,11 @@ class RunLogStore(context: Context) {
         lapsConfirmed: Boolean,
         trackName: String?,
         points: List<GeoPoint>,
+        heartSamples: List<TimedSample> = emptyList(),
     ): File {
         val stamp = fileStamp.format(Date(startedAtMs))
         val file = File(dir, "run_$stamp.json")
+        val heart = heartSamples.map { LogHeart.from(it) }
         val payload = RunLogFile(
             startedAtMs = startedAtMs,
             endedAtMs = endedAtMs,
@@ -38,7 +41,9 @@ class RunLogStore(context: Context) {
             lapsConfirmed = lapsConfirmed,
             trackName = trackName,
             pointCount = points.size,
+            heartSampleCount = heart.size,
             points = points.map { LogPoint.from(it) },
+            heart = heart,
         )
         file.writeText(json.encodeToString(payload))
         prune()
@@ -61,7 +66,9 @@ class RunLogStore(context: Context) {
         val lapsConfirmed: Boolean,
         val trackName: String? = null,
         val pointCount: Int,
+        val heartSampleCount: Int = 0,
         val points: List<LogPoint>,
+        val heart: List<LogHeart> = emptyList(),
     )
 
     @Serializable
@@ -80,6 +87,17 @@ class RunLogStore(context: Context) {
                 acc = p.accuracyMeters,
                 speed = p.speedMps,
             )
+        }
+    }
+
+    /** Heart-rate sample: timestamp ms + bpm. */
+    @Serializable
+    data class LogHeart(
+        val t: Long,
+        val bpm: Int,
+    ) {
+        companion object {
+            fun from(s: TimedSample) = LogHeart(t = s.tMs, bpm = s.value)
         }
     }
 

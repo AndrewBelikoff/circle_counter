@@ -133,6 +133,34 @@ class LapDetectorTest {
         }
     }
 
+    @Test
+    fun manualLengthPreventsLockingAShortLoop() {
+        val detector = LapDetector(lapLengthHintMeters = 400.0)
+        var snap = detector.snapshot()
+        val short = generateOvalLaps(laps = 5, pointsPerLap = 80, radiusMeters = 45.0)
+        for (p in short) snap = detector.addPoint(p)
+        assertEquals(LapDetector.Phase.LEARNING, snap.phase)
+        assertEquals(0, snap.completedLaps)
+    }
+
+    @Test
+    fun infieldShortcutDoesNotCloseLapOnKnownTrack() {
+        val template = generateOvalLaps(laps = 1, pointsPerLap = 80, radiusMeters = 63.7)
+        val ringLen = GeoMath.ringLengthMeters(GeoMath.resampleClosedRing(template, 48))
+        val shortcut = infieldShortcut(ringLen)
+        val detector = LapDetector(knownTemplate = template)
+        var snap = detector.snapshot()
+        var t = 1_700_000_000_000L
+        repeat(3) {
+            for (p in shortcut) {
+                t += 1000L
+                snap = detector.addPoint(p.copy(timestampMs = t))
+            }
+        }
+        snap = detector.finish()
+        assertEquals(0, snap.completedLaps)
+    }
+
     /**
      * Approximate 400m oval around a Moscow-ish coordinate.
      */
@@ -161,6 +189,33 @@ class LapDetectorTest {
                 t += 1000L
             }
         }
+        return out
+    }
+
+    /** Stay near the oval center long enough to look like a lap, then return to the start point. */
+    private fun infieldShortcut(targetMeters: Double): List<GeoPoint> {
+        val centerLat = 55.7558
+        val centerLon = 37.6173
+        val start = generateOvalLaps(laps = 1, pointsPerLap = 80, radiusMeters = 63.7).first()
+        val mLat = 111_320.0
+        val mLon = 111_320.0 * cos(Math.toRadians(centerLat))
+        val out = ArrayList<GeoPoint>()
+        out += start
+        var traveled = 0.0
+        var i = 0
+        var prev = start
+        while (traveled < targetMeters * 0.95) {
+            val angle = 2 * Math.PI * i / 24.0
+            val p = GeoPoint(
+                latitude = centerLat + 5.0 * sin(angle) / mLat,
+                longitude = centerLon + 5.0 * cos(angle) / mLon,
+            )
+            traveled += GeoMath.haversineMeters(prev, p)
+            out += p
+            prev = p
+            i++
+        }
+        out += start
         return out
     }
 }

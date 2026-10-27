@@ -40,6 +40,10 @@ class LapDetector(
         val maxRefineLaps: Int = 12,
         /** Moving this much farther than the closest approach means the gate was passed. */
         val gateExitMarginMeters: Double = 20.0,
+        /** A point this close to the saved ring still counts as "on the track". */
+        val onTrackRadiusMeters: Double = 45.0,
+        /** Share of the lap that must stay on the ring. A field shortcut falls short. */
+        val minOnTrackFraction: Double = 0.70,
     )
 
     /** Shape of the ring built from this run's clean laps. */
@@ -93,7 +97,10 @@ class LapDetector(
     private val knownMode: Boolean
     private val lapLengthHint: Double? = lapLengthHintMeters
         ?.takeIf { it in config.minLapMeters..config.maxLapMeters }
-    /** Known track without a manual length: expected lap may still adapt. */
+    /**
+     * Manual length, or a stored ring, is the lap length for the whole run.
+     * Blending it toward whatever GPS just measured is what collapsed the template.
+     */
     private val expectedFixed: Boolean
 
     init {
@@ -102,7 +109,7 @@ class LapDetector(
             ?.let { GeoMath.resampleClosedRing(it, config.pathSamples) }
         val usable = candidate != null && isPlausibleRing(candidate)
         knownMode = usable
-        expectedFixed = usable && lapLengthHint != null
+        expectedFixed = usable || lapLengthHint != null
         if (usable) {
             template = candidate
             phase = Phase.CONFIRMED
@@ -237,6 +244,12 @@ class LapDetector(
 
     private fun processLearning() {
         if (startGate == null || points.size < 12) return
+        val hint = lapLengthHint
+        if (hint != null) {
+            if (expectedLapMeters == null) expectedLapMeters = hint
+            processLearningWithHint(hint)
+            return
+        }
         if (!leftStartZone) return
 
         val fromIdx = maxOf(learnFromIndex, currentLapStartIndex).coerceIn(0, points.lastIndex)
@@ -272,10 +285,50 @@ class LapDetector(
         completedLaps = 1
     }
 
+    /**
+     * With a manual length, close the first lap the same way as a known track:
+     * one return to the gate inside the length band. Several short loops must
+     * not add up to a fake 400 m lap.
+     */
+    private fun processLearningWithHint(hint: Double) {
+        val start = maxOf(learnFromIndex, currentLapStartIndex)
+        val scan = scanLap(start, hint)
+        when (scan.result) {
+            LapResult.TOO_EARLY -> return
+            LapResult.MISSED_WINDOW -> {
+                learnFromIndex = scan.endIndex
+                resetLapWindow(scan.endIndex)
+            }
+            LapResult.COMPLETED -> {
+                val lapPoints = points.subList(start, scan.endIndex + 1).toList()
+                val lapLen = GeoMath.pathLengthMeters(lapPoints)
+                if (lapLen < config.minLapMeters ||
+                    GeoMath.pathExtentMeters(lapPoints) < config.minLapExtentMeters
+                ) {
+                    resetLapWindow(scan.endIndex)
+                    return
+                }
+                val ring = GeoMath.resampleClosedRing(lapPoints, config.pathSamples)
+                if (!isPlausibleRing(ring)) return
+                set1 = lapPoints
+                template = ring
+                expectedLapMeters = hint
+                missStreak = 0
+                lapSplits.clear()
+                lapLengths.clear()
+                recordSplit(lapNumber = 1, startIndex = start, endIndex = scan.endIndex)
+                resetLapWindow(scan.endIndex)
+                phase = Phase.HYPOTHESIS_SECOND
+                completedLaps = 1
+            }
+        }
+    }
+
     private fun slideLearningWindow() {
         var idx = points.lastIndex
         var lookback = 0.0
-        while (idx > 0 && lookback < config.minLapMeters) {
+        val keep = lapLengthHint ?: config.minLapMeters
+        while (idx > 0 && lookback < keep) {
             lookback += GeoMath.haversineMeters(points[idx - 1], points[idx])
             idx--
         }
@@ -301,7 +354,7 @@ class LapDetector(
                     return
                 }
                 set2 = currentLap
-                expectedLapMeters = blendLapLength(expectedLapMeters, lapLen)
+                observeLapLength(lapLen)
                 val averaged = GeoMath.averageRings(listOfNotNull(set1, set2), config.pathSamples)
                 if (isPlausibleRing(averaged)) {
                     template = averaged
@@ -332,7 +385,7 @@ class LapDetector(
                 if (isPlausibleRing(averaged)) {
                     template = averaged
                 }
-                expectedLapMeters = blendLapLength(expectedLapMeters, lapLen)
+                observeLapLength(lapLen)
                 refineLaps.clear()
                 refineLaps.addAll(laps)
                 phase = Phase.CONFIRMED
@@ -389,9 +442,7 @@ class LapDetector(
                 }
                 val expected = expectedLapMeters
                 if (expected != null && isCleanLap(currentLap, lapLen, expected)) {
-                    if (!expectedFixed) {
-                        expectedLapMeters = blendLapLength(expected, lapLen)
-                    }
+                    observeLapLength(lapLen)
                     // A stored track keeps its template for the whole run; see runRing().
                     if (!knownMode) {
                         refineLaps.addLast(currentLap)
@@ -456,9 +507,30 @@ class LapDetector(
 
     private enum class LapResult { TOO_EARLY, COMPLETED, MISSED_WINDOW }
 
+    private fun observeLapLength(observed: Double) {
+        if (expectedFixed) return
+        expectedLapMeters = blendLapLength(expectedLapMeters, observed)
+    }
+
     private fun blendLapLength(previous: Double?, observed: Double): Double {
         if (previous == null) return observed
         return previous * 0.75 + observed * 0.25
+    }
+
+    /**
+     * True when this closure follows the stored ring, not a shortcut back to the gate.
+     * Only a saved track has a ring that is independent of this run.
+     */
+    private fun onTrack(start: Int, end: Int): Boolean {
+        if (!knownMode) return true
+        val tpl = template ?: return true
+        val expected = expectedLapMeters ?: return true
+        if (end <= start + 3) return true
+        val ringLen = GeoMath.ringLengthMeters(tpl)
+        if (ringLen !in expected * config.refineMinFactor..expected * config.refineMaxFactor) return true
+        val lap = points.subList(start, end + 1)
+        val onRing = GeoMath.fractionNearRing(lap, tpl, config.onTrackRadiusMeters)
+        return onRing >= config.minOnTrackFraction
     }
 
     /** [endIndex]: lap end for COMPLETED, restart point for MISSED_WINDOW. */
@@ -486,8 +558,10 @@ class LapDetector(
     private fun scanLap(start: Int, expected: Double, final: Boolean = false): LapScan {
         val gate = startGate ?: return LapScan(LapResult.TOO_EARLY)
         val radius = activeMatchRadius()
-        val minLen = maxOf(config.minLapMeters, expected * config.lengthMinFactor)
+        val lengthFactorMin = if (expectedFixed) config.refineMinFactor else config.lengthMinFactor
+        val minLen = maxOf(config.minLapMeters, expected * lengthFactorMin)
         val abandonLen = expected * config.abandonFactor
+        val maxClose = expected * if (expectedFixed) config.refineMaxFactor else config.lengthMaxFactor
         val strongLimit = radius * 1.35
         val weakLimit = maxOf(strongLimit, expected * 0.28)
         val weakFrom = expected * config.refineMinFactor
@@ -497,8 +571,17 @@ class LapDetector(
         var left = false
         var bestIdx = -1
         var bestD = Double.POSITIVE_INFINITY
+        var bestTraveled = 0.0
         var weakIdx = -1
         var weakD = Double.POSITIVE_INFINITY
+        fun rejectApproach() {
+            left = false
+            bestIdx = -1
+            bestD = Double.POSITIVE_INFINITY
+            bestTraveled = 0.0
+            weakIdx = -1
+            weakD = Double.POSITIVE_INFINITY
+        }
         for (i in start + 1..points.lastIndex) {
             traveled += GeoMath.haversineMeters(points[i - 1], points[i])
             val d = GeoMath.haversineMeters(points[i], gate)
@@ -506,23 +589,36 @@ class LapDetector(
                 if (d > radius * 1.2) left = true else continue
             }
             if (traveled > abandonLen) return LapScan(LapResult.MISSED_WINDOW, i)
-            if (traveled < minLen) continue
-            if (d < bestD) {
+            if (traveled >= config.minLapMeters && d < bestD) {
                 bestD = d
                 bestIdx = i
+                bestTraveled = traveled
             }
+            val passedGate = bestD <= strongLimit && d >= bestD + config.gateExitMarginMeters
+            // A short loop came back to the gate. Start the next attempt there
+            // instead of letting several short loops add up to the manual length.
+            if (expectedFixed && passedGate && bestTraveled < minLen) {
+                return LapScan(LapResult.MISSED_WINDOW, bestIdx)
+            }
+            if (traveled < minLen) continue
             if (traveled in weakFrom..weakTo && d < weakD) {
                 weakD = d
                 weakIdx = i
             }
-            if (bestD <= strongLimit && d >= bestD + config.gateExitMarginMeters) {
-                return LapScan(LapResult.COMPLETED, bestIdx)
+            val strongReady = passedGate && (!expectedFixed || traveled <= maxClose)
+            if (strongReady) {
+                if (onTrack(start, bestIdx)) return LapScan(LapResult.COMPLETED, bestIdx)
+                rejectApproach()
+                continue
             }
             if (traveled > weakTo && weakD <= weakLimit) {
-                return LapScan(LapResult.COMPLETED, weakIdx)
+                if (onTrack(start, weakIdx)) return LapScan(LapResult.COMPLETED, weakIdx)
+                rejectApproach()
             }
         }
-        if (final && bestD <= strongLimit) return LapScan(LapResult.COMPLETED, bestIdx)
+        if (final && bestD <= strongLimit && onTrack(start, bestIdx)) {
+            return LapScan(LapResult.COMPLETED, bestIdx)
+        }
         return LapScan(LapResult.TOO_EARLY)
     }
 
